@@ -1,88 +1,56 @@
-import os
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
-import pandas as pd
-from urllib.parse import quote_plus
+import torch
+import torch.nn as nn
+import numpy as np
+import logging
 
-# Load environment variables
-load_dotenv()
+logger = logging.getLogger(__name__)
 
-class DataLoader:
-    def __init__(self):
-        host = os.getenv('DB_HOST')
-        database = os.getenv('DB_NAME')
-        user = os.getenv('DB_USER')
-        password = os.getenv('DB_PASSWORD')
-        port = os.getenv('DB_PORT', 5432)
+class LSTMForecaster(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
+        super(LSTMForecaster, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
 
-        encoded_password = quote_plus(password)
-        self.connection_string = f"postgresql://{user}:{encoded_password}@{host}:{port}/{database}"
-        self.engine = create_engine(self.connection_string)
-
-    def load_sku_history(self, start_date, end_date):
-        query = """
-        SELECT o.order_date, oi.sku, oi.quantity, oi.unit_price, oi.name
-        FROM orders o
-        JOIN order_items oi ON o.id = oi.order_id
-        WHERE o.order_date BETWEEN :start_date AND :end_date
-        """
-        df = pd.read_sql_query(text(query), self.engine, params={'start_date': start_date, 'end_date': end_date})
-        return df
-
-    def preprocess_data(self, df):
-        # Convert order_date to datetime
-        df['order_date'] = pd.to_datetime(df['order_date'])
+    def forward(self, x):
+        batch_size = x.size(0)
+        h0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(x.device)
+        c0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(x.device)
         
-        # Calculate total price for each item
-        df['total_price'] = df['quantity'] * df['unit_price']
-        
-        # Group by date and SKU, sum the quantities and total prices
-        df_grouped = df.groupby(['order_date', 'sku']).agg({
-            'quantity': 'sum',
-            'total_price': 'sum',
-            'name': 'first'  # Keep the name for reference
-        }).reset_index()
-        
-        # Pivot the table to have SKUs as columns for quantity
-        df_qty_pivoted = df_grouped.pivot(index='order_date', columns='sku', values='quantity').fillna(0)
-        
-        # Resample to daily frequency and forward fill missing values
-        df_daily = df_qty_pivoted.resample('D').ffill()
-        
-        return df_daily
+        out, _ = self.lstm(x, (h0, c0))
+        out = self.fc(out[:, -1, :])
+        return out
 
-    def get_sku_info(self):
-        query = """
-        SELECT DISTINCT sku, name
-        FROM order_items
-        ORDER BY sku
-        """
-        return pd.read_sql_query(query, self.engine)
+class InventoryForecastModel:
+    def __init__(self, input_size: int = 1, hidden_size: int = 64, num_layers: int = 2, output_size: int = 1):
+        self.model = LSTMForecaster(input_size, hidden_size, num_layers, output_size)
+        self.optimizer = torch.optim.Adam(self.model.parameters())
+        self.criterion = nn.MSELoss()
 
-    def get_sku_list(self):
-        return self.get_sku_info()['sku'].tolist()
+    def fit(self, X: np.ndarray, y: np.ndarray, epochs: int = 100) -> None:
+        X_tensor = torch.FloatTensor(X)
+        y_tensor = torch.FloatTensor(y)
+        self.model.train()
+        for epoch in range(epochs):
+            self.optimizer.zero_grad()
+            y_pred = self.model(X_tensor)
+            loss = self.criterion(y_pred, y_tensor)
+            loss.backward()
+            self.optimizer.step()
+            if epoch % 10 == 0:
+                logger.info(f"Epoch {epoch}, Loss: {loss.item()}")
 
-if __name__ == "__main__":
-    # Example usage
-    loader = DataLoader()
-    
-    # Load and preprocess data for the year 2023
-    raw_data = loader.load_sku_history('2023-01-01', '2023-12-31')
-    processed_data = loader.preprocess_data(raw_data)
-    
-    print("Processed data shape:", processed_data.shape)
-    print("Number of SKUs:", len(processed_data.columns))
-    
-    # Display first few rows of processed data
-    print(processed_data.head())
-    
-    # Get SKU information
-    sku_info = loader.get_sku_info()
-    print("\nSKU Information:")
-    print(sku_info.head())
-
-    # Example of how this data can inform purchasing decisions
-    last_30_days = processed_data.last('30D')
-    avg_daily_demand = last_30_days.mean()
-    print("\nAverage daily demand for each SKU (last 30 days):")
-    print(avg_daily_demand.sort_values(ascending=False).head())
+    def predict(self, data: np.ndarray, steps: int) -> np.ndarray:
+        self.model.eval()
+        with torch.no_grad():
+            predictions = []
+            # Ensure input tensor has the correct shape: (1, sequence_length, input_size)
+            input_tensor = torch.FloatTensor(data).unsqueeze(0)  # Adds batch dimension to (sequence_length, input_size)
+            for _ in range(steps):
+                output = self.model(input_tensor)  # Model expects (batch_size, sequence_length, input_size)
+                predictions.append(output.item())
+                # Shift the input tensor and append the output to the end
+                input_tensor = torch.cat([input_tensor[:, 1:, :], output.unsqueeze(0).unsqueeze(2)], dim=1)
+                # input_tensor shape remains (1, sequence_length, input_size)
+        return np.array(predictions)
